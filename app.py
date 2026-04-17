@@ -6,6 +6,14 @@ from __future__ import annotations
 
 import streamlit as st
 import pandas as pd
+import hmac
+import hashlib
+import json
+import re
+import time
+import base64
+from pathlib import Path
+import streamlit.components.v1 as _components
 
 st.set_page_config(
     page_title="RTO / ZRTO Dashboard",
@@ -14,9 +22,291 @@ st.set_page_config(
     initial_sidebar_state="collapsed",
 )
 
-CSV_PATH = "601168f592cc35c1ef35fc3672be19d9.csv"
+ROOT_DIR = Path(__file__).resolve().parent
+CSV_PATH = ROOT_DIR / "601168f592cc35c1ef35fc3672be19d9.csv"
+CLIENT_LIST_CSV = ROOT_DIR / "client list.csv"
+ADMIN_EMAILS_JSON = ROOT_DIR / "admin_emails.json"
+
+_EMAIL_RE = re.compile(r"^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$")
 
 
+# ─────────────────────────────────────────────────────────────────
+# AUTH HELPERS
+# ─────────────────────────────────────────────────────────────────
+def _safe_secret_compare(a: str, b: str) -> bool:
+    try:
+        return hmac.compare_digest(a.encode("utf-8"), b.encode("utf-8"))
+    except ValueError:
+        return False
+
+
+def _norm_email(s: str) -> str:
+    return (s or "").strip().lower()
+
+
+def _dashboard_auth_cfg() -> dict:
+    try:
+        x = st.secrets.get("dashboard_auth")
+        if x is None:
+            return {}
+        return dict(x)
+    except Exception:
+        return {}
+
+
+def _load_admin_emails_from_disk() -> list[str]:
+    if not ADMIN_EMAILS_JSON.is_file():
+        return []
+    try:
+        data = json.loads(ADMIN_EMAILS_JSON.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return []
+    if not isinstance(data, list):
+        return []
+    return sorted({_norm_email(e) for e in data if isinstance(e, str) and _norm_email(e)})
+
+
+def _save_admin_emails_to_disk(emails: list[str]) -> None:
+    norm = sorted({_norm_email(e) for e in emails if _norm_email(e)})
+    ADMIN_EMAILS_JSON.write_text(json.dumps(norm, indent=2), encoding="utf-8")
+
+
+def _ensure_admin_file_seeded() -> None:
+    cfg = _dashboard_auth_cfg()
+    boot = cfg.get("bootstrap_admin_emails") or []
+    if not isinstance(boot, list):
+        boot = []
+    boot_norm = [_norm_email(e) for e in boot if _norm_email(e)]
+    if not ADMIN_EMAILS_JSON.is_file() and boot_norm:
+        _save_admin_emails_to_disk(boot_norm)
+
+
+def _viewer_accounts() -> list[dict]:
+    cfg = _dashboard_auth_cfg()
+    v = cfg.get("viewers")
+    if not v:
+        return []
+    if isinstance(v, list):
+        return [dict(x) for x in v if isinstance(x, dict)]
+    return []
+
+
+def _attempt_login(email: str, password: str) -> tuple[bool, str, str, str | None]:
+    em = _norm_email(email)
+    pwd = password or ""
+    cfg = _dashboard_auth_cfg()
+    admin_pwd = str(cfg.get("admin_password", "") or "")
+    _ensure_admin_file_seeded()
+    admins = _load_admin_emails_from_disk()
+    if em and em in admins and admin_pwd and _safe_secret_compare(pwd, admin_pwd):
+        return True, "admin", "", None
+    for row in _viewer_accounts():
+        ve = _norm_email(str(row.get("email", "")))
+        vp = str(row.get("password", "") or "")
+        zone = str(row.get("zone", "") or "").strip()
+        if ve == em and vp and _safe_secret_compare(pwd, vp):
+            if not zone:
+                return False, "", "Viewer account missing zone in secrets.", None
+            return True, "viewer", "", zone
+    if not cfg and not _viewer_accounts():
+        return False, "", "Missing dashboard_auth in .streamlit/secrets.toml.", None
+    return False, "", "Invalid email or password.", None
+
+
+# ─────────────────────────────────────────────────────────────────
+# COOKIE-BASED SESSION PERSISTENCE
+# ─────────────────────────────────────────────────────────────────
+_COOKIE_NAME = "rto_dash_session"
+_COOKIE_MAX_AGE = 86400 * 7
+
+
+def _get_cookie_secret() -> str:
+    cfg = _dashboard_auth_cfg()
+    admin_pwd = str(cfg.get("admin_password", "") or "fallback-key")
+    return hashlib.sha256(f"rto-dash-{admin_pwd}".encode()).hexdigest()
+
+
+def _sign_session(email: str, role: str, zone: str | None) -> str:
+    secret = _get_cookie_secret()
+    expiry = int(time.time()) + _COOKIE_MAX_AGE
+    payload = json.dumps({"email": email, "role": role, "zone": zone, "exp": expiry})
+    payload_b64 = base64.urlsafe_b64encode(payload.encode()).decode()
+    sig = hmac.new(secret.encode(), payload_b64.encode(), hashlib.sha256).hexdigest()
+    return f"{payload_b64}.{sig}"
+
+
+def _verify_session(token: str) -> dict | None:
+    try:
+        secret = _get_cookie_secret()
+        parts = token.split(".", 1)
+        if len(parts) != 2:
+            return None
+        payload_b64, sig = parts
+        expected = hmac.new(secret.encode(), payload_b64.encode(), hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(sig, expected):
+            return None
+        payload = json.loads(base64.urlsafe_b64decode(payload_b64))
+        if payload.get("exp", 0) < time.time():
+            return None
+        return payload
+    except Exception:
+        return None
+
+
+def _read_session_cookie() -> dict | None:
+    try:
+        token = st.context.cookies.get(_COOKIE_NAME)
+        if not token:
+            return None
+        return _verify_session(token)
+    except Exception:
+        return None
+
+
+def _set_session_cookie(email: str, role: str, zone: str | None) -> None:
+    token = _sign_session(email, role, zone)
+    _components.html(
+        f"<script>document.cookie='{_COOKIE_NAME}={token};path=/;max-age={_COOKIE_MAX_AGE};SameSite=Lax';</script>",
+        height=0,
+    )
+
+
+def _clear_session_cookie() -> None:
+    _components.html(
+        f"<script>document.cookie='{_COOKIE_NAME}=;path=/;max-age=0;SameSite=Lax';</script>",
+        height=0,
+    )
+
+
+# ─────────────────────────────────────────────────────────────────
+# CLIENT LIST → seller code to region mapping
+# ─────────────────────────────────────────────────────────────────
+@st.cache_data(ttl=300)
+def _load_code_to_region(path: str) -> dict[str, str]:
+    mapping: dict[str, str] = {}
+    p = Path(path)
+    if not p.is_file():
+        return mapping
+    try:
+        df = pd.read_csv(p)
+    except Exception:
+        return mapping
+    cols_lower = {str(c).strip().lower(): c for c in df.columns}
+
+    def _pick(*subs: str) -> str | None:
+        for key, orig in cols_lower.items():
+            if all(s in key for s in subs):
+                return orig
+        return None
+
+    code_key = _pick("customer", "code") or _pick("seller", "code")
+    region_key = _pick("region")
+    if not code_key or not region_key:
+        return mapping
+    for _, row in df.iterrows():
+        codes_cell = row[code_key]
+        if pd.isna(codes_cell):
+            continue
+        region = row[region_key]
+        if pd.isna(region):
+            continue
+        region = str(region).strip()
+        for code in str(codes_cell).strip().split("/"):
+            code = code.strip().upper()
+            if code and region:
+                mapping[code] = region
+    return mapping
+
+
+CODE_TO_REGION = _load_code_to_region(str(CLIENT_LIST_CSV))
+
+
+def _seller_types_in_zone(seller_types: list, zone: str) -> list[str]:
+    z = (zone or "").strip()
+    if not z:
+        return []
+    out: list[str] = []
+    for stype in seller_types:
+        if not isinstance(stype, str):
+            continue
+        for part in stype.split("/"):
+            if CODE_TO_REGION.get(part.strip().upper()) == z:
+                out.append(stype)
+                break
+    return sorted(set(out))
+
+
+# ─────────────────────────────────────────────────────────────────
+# SESSION INITIALIZATION
+# ─────────────────────────────────────────────────────────────────
+if "_session_initialized" not in st.session_state:
+    st.session_state._session_initialized = True
+    session = _read_session_cookie()
+    if session:
+        st.session_state.authenticated = True
+        st.session_state.auth_email = session.get("email", "")
+        st.session_state.auth_role = session.get("role", "")
+        st.session_state.auth_zone = session.get("zone")
+    else:
+        st.session_state.authenticated = False
+        st.session_state.auth_email = ""
+        st.session_state.auth_role = ""
+        st.session_state.auth_zone = None
+else:
+    if "authenticated" not in st.session_state:
+        st.session_state.authenticated = False
+    if "auth_email" not in st.session_state:
+        st.session_state.auth_email = ""
+    if "auth_role" not in st.session_state:
+        st.session_state.auth_role = ""
+    if "auth_zone" not in st.session_state:
+        st.session_state.auth_zone = None
+
+# ─────────────────────────────────────────────────────────────────
+# LOGIN GATE
+# ─────────────────────────────────────────────────────────────────
+if not st.session_state.authenticated:
+    if st.session_state.pop("_needs_cookie_clear", False):
+        _clear_session_cookie()
+    st.title("RTO / ZRTO Dashboard \u2014 Sign in")
+    cfg = _dashboard_auth_cfg()
+    if not cfg.get("admin_password") and not _viewer_accounts():
+        st.error(
+            "Configure **[dashboard_auth]** in `.streamlit/secrets.toml`."
+        )
+    with st.form("login_form"):
+        le = st.text_input("Email")
+        lp = st.text_input("Password", type="password")
+        sub = st.form_submit_button("Sign in")
+    if sub:
+        ok, role, msg, zone = _attempt_login(le, lp)
+        if ok:
+            st.session_state.authenticated = True
+            st.session_state.auth_email = _norm_email(le)
+            st.session_state.auth_role = role
+            st.session_state.auth_zone = zone
+            st.session_state._needs_cookie_set = True
+            st.rerun()
+        elif msg:
+            st.error(msg)
+    st.stop()
+
+IS_ADMIN = st.session_state.auth_role == "admin"
+
+if st.session_state.pop("_needs_cookie_set", False):
+    _set_session_cookie(
+        st.session_state.auth_email,
+        st.session_state.auth_role,
+        st.session_state.auth_zone,
+    )
+
+if st.session_state.pop("_needs_cookie_clear", False):
+    _clear_session_cookie()
+
+
+# ─────────────────────────────────────────────────────────────────
+# DATA LOADING
+# ─────────────────────────────────────────────────────────────────
 @st.cache_data(show_spinner="Loading data \u2026")
 def load_data() -> pd.DataFrame:
     df = pd.read_csv(CSV_PATH, dtype={"reporting_date": str})
@@ -39,6 +329,59 @@ def get_total_shipments(frame: pd.DataFrame) -> int:
 
 
 df_all = load_data()
+
+# ── Zone-based filtering for viewers ─────────────────────────────
+if st.session_state.auth_role == "viewer":
+    vz = st.session_state.auth_zone or ""
+    all_types = list(df_all["seller_type"].unique())
+    allowed_types = _seller_types_in_zone(all_types, vz)
+    df_all = df_all[df_all["seller_type"].isin(allowed_types)]
+    if df_all.empty:
+        st.warning(
+            f"No rows match your zone **{vz}** for the seller codes in this data. "
+            "Check that seller codes exist in the client list with that Region."
+        )
+        st.stop()
+
+# ── Sidebar: user info, logout, admin panel ──────────────────────
+with st.sidebar:
+    role_label = "Admin" if IS_ADMIN else f"Viewer ({st.session_state.auth_zone or '\u2014'})"
+    st.caption(f"**{st.session_state.auth_email}** \u00b7 {role_label}")
+    if st.button("Log out", use_container_width=True, key="logout_btn"):
+        st.session_state.authenticated = False
+        st.session_state.auth_email = ""
+        st.session_state.auth_role = ""
+        st.session_state.auth_zone = None
+        st.session_state._needs_cookie_clear = True
+        st.rerun()
+
+    if IS_ADMIN:
+        st.divider()
+        with st.expander("Admin users", expanded=False):
+            cur_admins = _load_admin_emails_from_disk()
+            if cur_admins:
+                st.markdown("**Admin emails**")
+                for _e in cur_admins:
+                    st.text(_e)
+            else:
+                st.caption("No admin emails on file.")
+            new_ad = st.text_input("Add admin email", key="new_admin_email_input")
+            if st.button("Add email", key="add_admin_email_btn"):
+                ne = _norm_email(new_ad)
+                if not ne or not _EMAIL_RE.match(ne):
+                    st.error("Enter a valid email address.")
+                elif ne in cur_admins:
+                    st.warning("That email is already an admin.")
+                else:
+                    _save_admin_emails_to_disk(cur_admins + [ne])
+                    st.success(f"Added {ne}")
+                    st.rerun()
+            rm_opts = ["\u2014"] + cur_admins
+            rm_pick = st.selectbox("Remove admin", options=rm_opts, key="remove_admin_select")
+            if st.button("Remove selected", key="remove_admin_btn") and rm_pick != "\u2014":
+                _save_admin_emails_to_disk([e for e in cur_admins if e != rm_pick])
+                st.success(f"Removed {rm_pick}")
+                st.rerun()
 
 # ── Header ───────────────────────────────────────────────────────
 st.markdown("# \U0001F4E6 RTO / ZRTO Dashboard")
