@@ -480,14 +480,34 @@ delivered = total_shipments - total_rto
 delivered_pct = round(100 * delivered / total_shipments, 2) if total_shipments else 0.0
 
 overview_data = pd.DataFrame({
-    "Category": ["Delivered", "RTO (Non-ZRTO + ZRTO)", "ZRTO", "Non-ZRTO"],
-    "Shipments": [delivered, total_rto, zrto_total, non_zrto_total],
-    "% of Total Shipments": [delivered_pct, overall_rto_pct, zrto_pct_of_shipments, non_zrto_pct_of_shipments],
+    "Category": ["Delivered", "Overall RTO (Non-ZRTO + ZRTO)"],
+    "Shipments": [delivered, total_rto],
+    "% of Total Shipments": [delivered_pct, overall_rto_pct],
 })
 st.dataframe(
     overview_data.style.format({
         "Shipments": "{:,}",
         "% of Total Shipments": "{:.2f}%",
+    }),
+    use_container_width=True, hide_index=True,
+)
+
+st.markdown("### Overall RTO Breakup")
+
+zrto_pct_of_rto = round(100 * zrto_total / total_rto, 2) if total_rto else 0.0
+non_zrto_pct_of_rto = round(100 * non_zrto_total / total_rto, 2) if total_rto else 0.0
+
+rto_breakup_data = pd.DataFrame({
+    "Category": ["Non-ZRTO", "ZRTO"],
+    "Shipments": [non_zrto_total, zrto_total],
+    "% of Total Shipments": [non_zrto_pct_of_shipments, zrto_pct_of_shipments],
+    "% of Total RTO": [non_zrto_pct_of_rto, zrto_pct_of_rto],
+})
+st.dataframe(
+    rto_breakup_data.style.format({
+        "Shipments": "{:,}",
+        "% of Total Shipments": "{:.2f}%",
+        "% of Total RTO": "{:.2f}%",
     }),
     use_container_width=True, hide_index=True,
 )
