@@ -1,0 +1,10 @@
+.env
+.venv/
+.chrome_profile/
+downloads/
+logs/
+screenshots/
+__pycache__/
+*.pyc
+debug-*.log
+.streamlit/secrets.toml
